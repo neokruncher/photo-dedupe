@@ -47,6 +47,10 @@ comparison_log.txt
 results.csv
 Unique_to_Import/
 
+# Cache and reports
+cache/
+reports/
+
 # External drive paths (never commit)
 /Volumes/
 
