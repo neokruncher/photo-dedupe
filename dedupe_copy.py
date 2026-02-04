@@ -707,7 +707,8 @@ def run_deduplication(
     extensions: Optional[set[str]],
     logger: logging.Logger,
     csv_writer: Optional[Callable[[ProcessingResult], None]] = None,
-    max_image_pixels: Optional[int] = None
+    max_image_pixels: Optional[int] = None,
+    rebuild_cache: bool = False
 ) -> tuple[Stats, list[ProcessingResult]]:
     """
     Main deduplication workflow.
@@ -715,6 +716,7 @@ def run_deduplication(
     Args:
         csv_writer: Optional callback to write results incrementally to CSV.
         max_image_pixels: Optional limit for image size in pHash computation.
+        rebuild_cache: If True, force rebuild of indexes ignoring existing cache.
     """
     stats = Stats()
     results = []
@@ -744,10 +746,15 @@ def run_deduplication(
     current_fingerprint = compute_reference_fingerprint(ref_dir, ref_files)
     cached_fingerprint = load_cached_fingerprint(cache_dir)
 
-    cache_valid = (
-        cached_fingerprint is not None and
-        fingerprints_match(current_fingerprint, cached_fingerprint)
-    )
+    # Check if cache is valid (skip if rebuild_cache is set)
+    if rebuild_cache:
+        logger.info("Rebuild-cache enabled: forcing reference index rebuild")
+        cache_valid = False
+    else:
+        cache_valid = (
+            cached_fingerprint is not None and
+            fingerprints_match(current_fingerprint, cached_fingerprint)
+        )
 
     # PASS A: Build or load reference index
     ref_index = None
@@ -945,6 +952,10 @@ Examples:
         "--max-image-pixels", type=int, default=None,
         help="Max image pixels for pHash (default: Pillow default). Set to limit memory for huge images."
     )
+    parser.add_argument(
+        "--rebuild-cache", action="store_true",
+        help="Force rebuild of reference indexes, ignoring existing cache"
+    )
 
     return parser.parse_args()
 
@@ -1037,7 +1048,8 @@ def main():
                 extensions=extensions,
                 logger=logger,
                 csv_writer=csv_writer,
-                max_image_pixels=args.max_image_pixels
+                max_image_pixels=args.max_image_pixels,
+                rebuild_cache=args.rebuild_cache
             )
 
         logger.info(f"Results written to: {log_output_dir / 'results.csv'}")
