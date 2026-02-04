@@ -16,8 +16,10 @@ import csv
 import hashlib
 import logging
 import os
+import pickle
 import shutil
 import sys
+import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -54,10 +56,16 @@ except ImportError:
 DEFAULT_REF = "/Volumes/Thunder Drive/iPhotos"
 DEFAULT_TARGET = "/Volumes/Thunder Drive/Photos"
 DEFAULT_OUTPUT = "/Volumes/Thunder Drive/Unique_to_Import"
+DEFAULT_CACHE_DIR = "./cache"
 DEFAULT_CHUNK_SIZE = 256 * 1024  # 256KB
 DEFAULT_PHASH_THRESHOLD = 8
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 MAX_COLLISION_ATTEMPTS = 10000
+
+# Cache file names
+CACHE_FINGERPRINT_FILE = "ref_fingerprint.pkl"
+CACHE_PASS_A_FILE = "pass_a_index.pkl"
+CACHE_PASS_B_FILE = "pass_b_index.pkl"
 
 # Mac metadata files/dirs to ignore
 IGNORED_FILES = {".DS_Store"}
@@ -97,6 +105,15 @@ class PHashIndex:
     exact_map: dict = field(default_factory=lambda: defaultdict(list))
     # buckets: (chunk_idx, chunk_val) -> list of (path, phash_int)
     buckets: dict = field(default_factory=lambda: defaultdict(list))
+
+
+@dataclass
+class ReferenceFingerprint:
+    """Fingerprint for cache invalidation."""
+    ref_path: str
+    file_count: int
+    total_bytes: int
+    max_mtime: float
 
 
 @dataclass
@@ -187,17 +204,47 @@ def compute_blake2b(file_path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> st
         raise RuntimeError(f"Failed to hash {file_path}: {e}")
 
 
-def compute_phash(file_path: Path) -> Optional[imagehash.ImageHash]:
-    """Compute perceptual hash for an image file."""
+def compute_phash(file_path: Path, max_image_pixels: Optional[int] = None) -> Optional[imagehash.ImageHash]:
+    """
+    Compute perceptual hash for an image file.
+
+    Args:
+        file_path: Path to the image file.
+        max_image_pixels: Optional limit for image size. If None, uses Pillow default.
+
+    Returns:
+        ImageHash or None if the image cannot be processed.
+    """
+    logger = logging.getLogger("dedupe_copy")
+
+    # Temporarily set max image pixels if specified
+    old_max_pixels = Image.MAX_IMAGE_PIXELS
+    if max_image_pixels is not None:
+        Image.MAX_IMAGE_PIXELS = max_image_pixels
+
     try:
-        with Image.open(file_path) as img:
-            # Convert to RGB if necessary (handles various color modes)
-            if img.mode not in ('RGB', 'L'):
-                img = img.convert('RGB')
-            return imagehash.phash(img)
-    except Exception as e:
-        logging.getLogger("dedupe_copy").debug(f"Cannot compute pHash for {file_path}: {e}")
+        # Suppress DecompressionBombWarning - we handle large images gracefully
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
+
+            with Image.open(file_path) as img:
+                # Convert to RGB if necessary (handles various color modes)
+                if img.mode not in ('RGB', 'L'):
+                    img = img.convert('RGB')
+                return imagehash.phash(img)
+
+    except Image.DecompressionBombWarning as e:
+        logger.debug(f"Skipping huge image (DecompressionBomb) {file_path}: {e}")
         return None
+    except Image.DecompressionBombError as e:
+        logger.debug(f"Skipping huge image (DecompressionBombError) {file_path}: {e}")
+        return None
+    except Exception as e:
+        logger.debug(f"Cannot compute pHash for {file_path}: {e}")
+        return None
+    finally:
+        # Restore original setting
+        Image.MAX_IMAGE_PIXELS = old_max_pixels
 
 
 def collect_files(root_dir: Path, logger: logging.Logger) -> list[Path]:
@@ -284,6 +331,105 @@ def safe_copy(src: Path, dst: Path, logger: logging.Logger) -> Path:
 
 
 # -----------------------------------------------------------------------------
+# Cache Functions
+# -----------------------------------------------------------------------------
+
+def compute_reference_fingerprint(ref_dir: Path, ref_files: list[Path]) -> ReferenceFingerprint:
+    """
+    Compute a fingerprint for the reference directory to detect changes.
+
+    Uses: ref path, file count, total bytes, max mtime.
+    """
+    total_bytes = 0
+    max_mtime = 0.0
+
+    for f in ref_files:
+        try:
+            stat = f.stat()
+            total_bytes += stat.st_size
+            max_mtime = max(max_mtime, stat.st_mtime)
+        except OSError:
+            pass
+
+    return ReferenceFingerprint(
+        ref_path=str(ref_dir.resolve()),
+        file_count=len(ref_files),
+        total_bytes=total_bytes,
+        max_mtime=max_mtime
+    )
+
+
+def load_cached_fingerprint(cache_dir: Path) -> Optional[ReferenceFingerprint]:
+    """Load cached fingerprint from disk."""
+    fp_path = cache_dir / CACHE_FINGERPRINT_FILE
+    if not fp_path.exists():
+        return None
+    try:
+        with open(fp_path, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def save_fingerprint(cache_dir: Path, fingerprint: ReferenceFingerprint):
+    """Save fingerprint to disk."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fp_path = cache_dir / CACHE_FINGERPRINT_FILE
+    with open(fp_path, 'wb') as f:
+        pickle.dump(fingerprint, f)
+
+
+def fingerprints_match(fp1: ReferenceFingerprint, fp2: ReferenceFingerprint) -> bool:
+    """Check if two fingerprints match (cache is valid)."""
+    return (
+        fp1.ref_path == fp2.ref_path and
+        fp1.file_count == fp2.file_count and
+        fp1.total_bytes == fp2.total_bytes and
+        fp1.max_mtime == fp2.max_mtime
+    )
+
+
+def load_cached_pass_a(cache_dir: Path) -> Optional[ReferenceIndex]:
+    """Load cached PASS A index from disk."""
+    cache_path = cache_dir / CACHE_PASS_A_FILE
+    if not cache_path.exists():
+        return None
+    try:
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def save_pass_a_cache(cache_dir: Path, index: ReferenceIndex):
+    """Save PASS A index to disk."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / CACHE_PASS_A_FILE
+    with open(cache_path, 'wb') as f:
+        pickle.dump(index, f)
+
+
+def load_cached_pass_b(cache_dir: Path) -> Optional[PHashIndex]:
+    """Load cached PASS B index from disk."""
+    cache_path = cache_dir / CACHE_PASS_B_FILE
+    if not cache_path.exists():
+        return None
+    try:
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def save_pass_b_cache(cache_dir: Path, index: PHashIndex):
+    """Save PASS B index to disk."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / CACHE_PASS_B_FILE
+    with open(cache_path, 'wb') as f:
+        pickle.dump(index, f)
+
+
+# -----------------------------------------------------------------------------
 # Indexing Functions
 # -----------------------------------------------------------------------------
 
@@ -327,7 +473,8 @@ def index_reference_pass_a(
 def index_reference_pass_b(
     ref_files: list[Path],
     workers: int,
-    logger: logging.Logger
+    logger: logging.Logger,
+    max_image_pixels: Optional[int] = None
 ) -> PHashIndex:
     """
     PASS B: Build perceptual hash index for reference images using LSH-style buckets.
@@ -344,7 +491,7 @@ def index_reference_pass_b(
         return phash_index
 
     def process_image(file_path: Path) -> Optional[tuple]:
-        phash = compute_phash(file_path)
+        phash = compute_phash(file_path, max_image_pixels)
         if phash is not None:
             # Convert to 64-bit int for efficient comparison
             phash_int = int(str(phash), 16)
@@ -456,7 +603,8 @@ def process_target_file(
     chunk_size: int,
     dry_run: bool,
     logger: logging.Logger,
-    file_count: int = 0
+    file_count: int = 0,
+    max_image_pixels: Optional[int] = None
 ) -> ProcessingResult:
     """
     Process a single target file through the deduplication pipeline.
@@ -495,7 +643,7 @@ def process_target_file(
 
         # PASS B: Perceptual hash check for images
         if enable_phash and is_image_file(target_file) and phash_index.exact_map:
-            target_phash = compute_phash(target_file)
+            target_phash = compute_phash(target_file, max_image_pixels)
 
             if target_phash is not None:
                 match = find_phash_match(target_phash, phash_index, phash_threshold, logger, file_count)
@@ -550,6 +698,7 @@ def run_deduplication(
     ref_dir: Path,
     target_dir: Path,
     output_dir: Path,
+    cache_dir: Path,
     workers: int,
     chunk_size: int,
     phash_threshold: int,
@@ -557,13 +706,15 @@ def run_deduplication(
     dry_run: bool,
     extensions: Optional[set[str]],
     logger: logging.Logger,
-    csv_writer: Optional[Callable[[ProcessingResult], None]] = None
+    csv_writer: Optional[Callable[[ProcessingResult], None]] = None,
+    max_image_pixels: Optional[int] = None
 ) -> tuple[Stats, list[ProcessingResult]]:
     """
     Main deduplication workflow.
 
     Args:
         csv_writer: Optional callback to write results incrementally to CSV.
+        max_image_pixels: Optional limit for image size in pHash computation.
     """
     stats = Stats()
     results = []
@@ -589,13 +740,44 @@ def run_deduplication(
         logger.info("No target files to process")
         return stats, results
 
-    # PASS A: Build reference index
-    ref_index = index_reference_pass_a(ref_files, chunk_size, workers, logger)
+    # Compute current fingerprint for cache validation
+    current_fingerprint = compute_reference_fingerprint(ref_dir, ref_files)
+    cached_fingerprint = load_cached_fingerprint(cache_dir)
 
-    # PASS B: Build perceptual hash index (if enabled)
+    cache_valid = (
+        cached_fingerprint is not None and
+        fingerprints_match(current_fingerprint, cached_fingerprint)
+    )
+
+    # PASS A: Build or load reference index
+    ref_index = None
+    if cache_valid:
+        ref_index = load_cached_pass_a(cache_dir)
+        if ref_index is not None:
+            logger.info(f"PASS A: Loaded reference index from cache ({ref_index.total_files} files)")
+
+    if ref_index is None:
+        ref_index = index_reference_pass_a(ref_files, chunk_size, workers, logger)
+        save_pass_a_cache(cache_dir, ref_index)
+        logger.info("PASS A: Saved reference index to cache")
+
+    # PASS B: Build or load perceptual hash index (if enabled)
     phash_index = PHashIndex()
     if enable_phash:
-        phash_index = index_reference_pass_b(ref_files, workers, logger)
+        if cache_valid:
+            cached_phash = load_cached_pass_b(cache_dir)
+            if cached_phash is not None:
+                phash_index = cached_phash
+                logger.info(f"PASS B: Loaded pHash index from cache ({len(phash_index.exact_map)} unique hashes)")
+
+        if not phash_index.exact_map:
+            phash_index = index_reference_pass_b(ref_files, workers, logger, max_image_pixels)
+            save_pass_b_cache(cache_dir, phash_index)
+            logger.info("PASS B: Saved pHash index to cache")
+
+    # Save fingerprint after successful indexing
+    if not cache_valid:
+        save_fingerprint(cache_dir, current_fingerprint)
 
     # Process target files
     logger.info(f"Processing {len(target_files)} target files...")
@@ -611,7 +793,8 @@ def run_deduplication(
         return process_target_file(
             f, target_dir, output_dir, ref_index, phash_index,
             phash_threshold, enable_phash, chunk_size, dry_run, logger,
-            file_count=file_counter[0]
+            file_count=file_counter[0],
+            max_image_pixels=max_image_pixels
         )
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -709,6 +892,12 @@ Examples:
 
   # Process only JPEGs
   python dedupe_copy.py --extensions .jpg,.jpeg
+
+  # Use custom cache directory
+  python dedupe_copy.py --cache-dir /tmp/dedupe_cache
+
+  # Limit max image size for pHash (avoid memory issues with huge images)
+  python dedupe_copy.py --max-image-pixels 100000000
         """
     )
 
@@ -723,6 +912,10 @@ Examples:
     parser.add_argument(
         "--out", type=Path, default=Path(DEFAULT_OUTPUT),
         help=f"Output directory for unique files (default: {DEFAULT_OUTPUT})"
+    )
+    parser.add_argument(
+        "--cache-dir", type=Path, default=Path(DEFAULT_CACHE_DIR),
+        help=f"Cache directory for reference indexes (default: {DEFAULT_CACHE_DIR})"
     )
     parser.add_argument(
         "--workers", type=int, default=DEFAULT_WORKERS,
@@ -747,6 +940,10 @@ Examples:
     parser.add_argument(
         "--extensions", type=str, default=None,
         help="Comma-separated list of extensions to process (e.g., .jpg,.png)"
+    )
+    parser.add_argument(
+        "--max-image-pixels", type=int, default=None,
+        help="Max image pixels for pHash (default: Pillow default). Set to limit memory for huge images."
     )
 
     return parser.parse_args()
@@ -790,6 +987,9 @@ def main():
     if not args.dry_run:
         args.out.mkdir(parents=True, exist_ok=True)
 
+    # Create cache directory
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+
     # Setup logging
     logger = setup_logging(log_output_dir)
 
@@ -800,12 +1000,15 @@ def main():
     logger.info(f"Reference:     {args.ref}")
     logger.info(f"Target:        {args.target}")
     logger.info(f"Output:        {args.out}")
+    logger.info(f"Cache:         {args.cache_dir}")
     logger.info(f"Log/Report:    {log_output_dir}")
     logger.info(f"Workers:       {args.workers}")
     logger.info(f"Chunk size:    {args.chunk_size:,} bytes")
     logger.info(f"pHash enabled: {not args.disable_phash}")
     if not args.disable_phash:
         logger.info(f"pHash thresh:  {args.phash_threshold}")
+    if args.max_image_pixels:
+        logger.info(f"Max img pixels:{args.max_image_pixels:,}")
     logger.info(f"HEIC support:  {HEIC_SUPPORTED}")
     logger.info(f"Dry-run:       {args.dry_run}")
     logger.info(f"Started:       {datetime.now().isoformat()}")
@@ -825,6 +1028,7 @@ def main():
                 ref_dir=args.ref,
                 target_dir=args.target,
                 output_dir=args.out,
+                cache_dir=args.cache_dir,
                 workers=args.workers,
                 chunk_size=args.chunk_size,
                 phash_threshold=args.phash_threshold,
@@ -832,7 +1036,8 @@ def main():
                 dry_run=args.dry_run,
                 extensions=extensions,
                 logger=logger,
-                csv_writer=csv_writer
+                csv_writer=csv_writer,
+                max_image_pixels=args.max_image_pixels
             )
 
         logger.info(f"Results written to: {log_output_dir / 'results.csv'}")
