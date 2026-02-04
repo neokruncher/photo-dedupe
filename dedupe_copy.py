@@ -20,10 +20,11 @@ import shutil
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     from tqdm import tqdm
@@ -56,6 +57,7 @@ DEFAULT_OUTPUT = "/Volumes/Thunder Drive/Unique_to_Import"
 DEFAULT_CHUNK_SIZE = 256 * 1024  # 256KB
 DEFAULT_PHASH_THRESHOLD = 8
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
+MAX_COLLISION_ATTEMPTS = 10000
 
 # Mac metadata files/dirs to ignore
 IGNORED_FILES = {".DS_Store"}
@@ -85,9 +87,16 @@ class ReferenceIndex:
     size_buckets: dict = field(default_factory=lambda: defaultdict(list))
     # blake2b_hash -> list of paths
     hash_to_paths: dict = field(default_factory=lambda: defaultdict(list))
-    # phash_string -> list of (path, phash_obj) for near-match comparison
-    phash_index: dict = field(default_factory=lambda: defaultdict(list))
     total_files: int = 0
+
+
+@dataclass
+class PHashIndex:
+    """LSH-style bucket index for fast perceptual hash lookup."""
+    # exact_map: phash_int -> list of (path, phash_int)
+    exact_map: dict = field(default_factory=lambda: defaultdict(list))
+    # buckets: (chunk_idx, chunk_val) -> list of (path, phash_int)
+    buckets: dict = field(default_factory=lambda: defaultdict(list))
 
 
 @dataclass
@@ -186,8 +195,8 @@ def compute_phash(file_path: Path) -> Optional[imagehash.ImageHash]:
             if img.mode not in ('RGB', 'L'):
                 img = img.convert('RGB')
             return imagehash.phash(img)
-    except Exception:
-        # Silently skip files that can't be processed as images
+    except Exception as e:
+        logging.getLogger("dedupe_copy").debug(f"Cannot compute pHash for {file_path}: {e}")
         return None
 
 
@@ -253,8 +262,8 @@ def safe_copy(src: Path, dst: Path, logger: logging.Logger) -> Path:
             if src_hash == dst_hash:
                 logger.debug(f"Destination already exists with identical content: {dst}")
                 return dst
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Could not compare existing file {dst}: {e}")
 
     # Generate collision-safe name
     stem = dst.stem
@@ -270,7 +279,7 @@ def safe_copy(src: Path, dst: Path, logger: logging.Logger) -> Path:
             logger.debug(f"Collision rename: {dst.name} -> {new_name}")
             return new_dst
         counter += 1
-        if counter > 10000:
+        if counter > MAX_COLLISION_ATTEMPTS:
             raise RuntimeError(f"Too many collisions for {dst}")
 
 
@@ -319,12 +328,16 @@ def index_reference_pass_b(
     ref_files: list[Path],
     workers: int,
     logger: logging.Logger
-) -> dict:
+) -> PHashIndex:
     """
-    PASS B: Build perceptual hash index for reference images.
-    Returns dict: phash_string -> list of (path, phash_obj)
+    PASS B: Build perceptual hash index for reference images using LSH-style buckets.
+
+    Splits each 64-bit pHash into 4 x 16-bit chunks and indexes by chunk value.
+    This allows O(1) candidate lookup instead of O(N) linear scan.
+
+    Returns PHashIndex with exact_map and bucket index.
     """
-    phash_index = defaultdict(list)
+    phash_index = PHashIndex()
     image_files = [f for f in ref_files if is_image_file(f)]
 
     if not image_files:
@@ -333,11 +346,14 @@ def index_reference_pass_b(
     def process_image(file_path: Path) -> Optional[tuple]:
         phash = compute_phash(file_path)
         if phash is not None:
-            return (file_path, phash)
+            # Convert to 64-bit int for efficient comparison
+            phash_int = int(str(phash), 16)
+            return (file_path, phash_int)
         return None
 
     logger.info("PASS B: Building perceptual hash index for reference images...")
 
+    indexed_count = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(process_image, f): f for f in image_files}
 
@@ -345,10 +361,24 @@ def index_reference_pass_b(
                           desc="pHash Reference", unit="images"):
             result = future.result()
             if result:
-                path, phash = result
-                phash_index[str(phash)].append((path, phash))
+                path, phash_int = result
+                indexed_count += 1
 
-    logger.info(f"pHash index: {len(phash_index)} unique perceptual hashes from {len(image_files)} images")
+                # Add to exact match map
+                phash_index.exact_map[phash_int].append((path, phash_int))
+
+                # Split into 4 x 16-bit chunks and add to bucket index
+                c0 = phash_int & 0xFFFF
+                c1 = (phash_int >> 16) & 0xFFFF
+                c2 = (phash_int >> 32) & 0xFFFF
+                c3 = (phash_int >> 48) & 0xFFFF
+
+                phash_index.buckets[(0, c0)].append((path, phash_int))
+                phash_index.buckets[(1, c1)].append((path, phash_int))
+                phash_index.buckets[(2, c2)].append((path, phash_int))
+                phash_index.buckets[(3, c3)].append((path, phash_int))
+
+    logger.info(f"pHash index: {len(phash_index.exact_map)} unique hashes, {indexed_count} images indexed")
     return phash_index
 
 
@@ -358,24 +388,59 @@ def index_reference_pass_b(
 
 def find_phash_match(
     target_phash: imagehash.ImageHash,
-    phash_index: dict,
-    threshold: int
+    phash_index: PHashIndex,
+    threshold: int,
+    logger: logging.Logger,
+    file_count: int
 ) -> Optional[tuple[Path, int]]:
     """
-    Find the best perceptual hash match within threshold.
+    Find the best perceptual hash match within threshold using LSH buckets.
+
+    Uses 4 x 16-bit chunk bucketing for fast candidate lookup.
+    Only compares against candidates that share at least one 16-bit chunk.
+
     Returns (matching_path, distance) or None.
     """
+    target_int = int(str(target_phash), 16)
+
+    # Fast path: exact match
+    if target_int in phash_index.exact_map:
+        return (phash_index.exact_map[target_int][0][0], 0)
+
+    # Gather candidates from buckets (images sharing at least one 16-bit chunk)
+    chunks = [
+        target_int & 0xFFFF,
+        (target_int >> 16) & 0xFFFF,
+        (target_int >> 32) & 0xFFFF,
+        (target_int >> 48) & 0xFFFF,
+    ]
+
+    seen = set()
+    candidates = []
+    for i, chunk in enumerate(chunks):
+        for ref_path, ref_int in phash_index.buckets.get((i, chunk), []):
+            if ref_int not in seen:
+                seen.add(ref_int)
+                candidates.append((ref_path, ref_int))
+
+    # Debug logging for large candidate sets or periodic status
+    if file_count % 1000 == 0 or len(candidates) > 5000:
+        logger.debug(f"pHash candidates: {len(candidates)} for file #{file_count}")
+
+    if not candidates:
+        return None
+
+    # Find best match using bit_count for Hamming distance
     best_match = None
     best_distance = threshold + 1
 
-    for phash_str, entries in phash_index.items():
-        for ref_path, ref_phash in entries:
-            distance = target_phash - ref_phash
-            if distance <= threshold and distance < best_distance:
-                best_distance = distance
-                best_match = (ref_path, distance)
-                if distance == 0:
-                    return best_match  # Perfect match, stop searching
+    for ref_path, ref_int in candidates:
+        distance = (target_int ^ ref_int).bit_count()
+        if distance <= threshold and distance < best_distance:
+            best_distance = distance
+            best_match = (ref_path, distance)
+            if distance == 0:
+                return best_match
 
     return best_match
 
@@ -385,12 +450,13 @@ def process_target_file(
     target_dir: Path,
     output_dir: Path,
     ref_index: ReferenceIndex,
-    phash_index: dict,
+    phash_index: PHashIndex,
     phash_threshold: int,
     enable_phash: bool,
     chunk_size: int,
     dry_run: bool,
-    logger: logging.Logger
+    logger: logging.Logger,
+    file_count: int = 0
 ) -> ProcessingResult:
     """
     Process a single target file through the deduplication pipeline.
@@ -410,7 +476,6 @@ def process_target_file(
 
         # PASS A: Check for exact byte-identical duplicates
         target_hash = None
-        is_byte_unique = True
 
         if size in ref_index.size_buckets:
             # Size match exists, compute hash for comparison
@@ -428,14 +493,12 @@ def process_target_file(
                     reason="Byte-identical match in reference"
                 )
 
-            is_byte_unique = False  # Same size but different hash
-
-        # PASS B: Perceptual hash check for images (only if byte-unique or size-match-but-different)
-        if enable_phash and is_image_file(target_file) and phash_index:
+        # PASS B: Perceptual hash check for images
+        if enable_phash and is_image_file(target_file) and phash_index.exact_map:
             target_phash = compute_phash(target_file)
 
             if target_phash is not None:
-                match = find_phash_match(target_phash, phash_index, phash_threshold)
+                match = find_phash_match(target_phash, phash_index, phash_threshold, logger, file_count)
 
                 if match:
                     match_path, distance = match
@@ -493,10 +556,14 @@ def run_deduplication(
     enable_phash: bool,
     dry_run: bool,
     extensions: Optional[set[str]],
-    logger: logging.Logger
+    logger: logging.Logger,
+    csv_writer: Optional[Callable[[ProcessingResult], None]] = None
 ) -> tuple[Stats, list[ProcessingResult]]:
     """
     Main deduplication workflow.
+
+    Args:
+        csv_writer: Optional callback to write results incrementally to CSV.
     """
     stats = Stats()
     results = []
@@ -526,7 +593,7 @@ def run_deduplication(
     ref_index = index_reference_pass_a(ref_files, chunk_size, workers, logger)
 
     # PASS B: Build perceptual hash index (if enabled)
-    phash_index = {}
+    phash_index = PHashIndex()
     if enable_phash:
         phash_index = index_reference_pass_b(ref_files, workers, logger)
 
@@ -536,10 +603,15 @@ def run_deduplication(
     if dry_run:
         logger.info("*** DRY-RUN MODE - No files will be copied ***")
 
+    # Track file count for periodic logging in pHash matching
+    file_counter = [0]  # Use list for closure mutability
+
     def process_wrapper(f):
+        file_counter[0] += 1
         return process_target_file(
             f, target_dir, output_dir, ref_index, phash_index,
-            phash_threshold, enable_phash, chunk_size, dry_run, logger
+            phash_threshold, enable_phash, chunk_size, dry_run, logger,
+            file_count=file_counter[0]
         )
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -549,6 +621,10 @@ def run_deduplication(
                           desc="Processing Target", unit="files"):
             result = future.result()
             results.append(result)
+
+            # Write result to CSV incrementally if writer provided
+            if csv_writer:
+                csv_writer(result)
 
             # Update stats
             if result.action == "copied":
@@ -563,22 +639,35 @@ def run_deduplication(
     return stats, results
 
 
-def write_results_csv(results: list[ProcessingResult], output_dir: Path):
-    """Write results to CSV file."""
+@contextmanager
+def streaming_csv_writer(output_dir: Path):
+    """
+    Context manager for streaming CSV results.
+
+    Flushes every 500 rows for auditability if interrupted.
+    """
     csv_path = output_dir / "results.csv"
+    f = open(csv_path, 'w', newline='', encoding='utf-8')
+    writer = csv.writer(f)
+    writer.writerow([
+        "target_path", "action", "match_path", "match_type",
+        "distance_or_hash", "reason"
+    ])
+    row_count = [0]  # mutable counter for closure
 
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
+    def write_result(result: ProcessingResult):
         writer.writerow([
-            "target_path", "action", "match_path", "match_type",
-            "distance_or_hash", "reason"
+            result.target_path, result.action, result.match_path,
+            result.match_type, result.distance_or_hash, result.reason
         ])
+        row_count[0] += 1
+        if row_count[0] % 500 == 0:
+            f.flush()
 
-        for r in results:
-            writer.writerow([
-                r.target_path, r.action, r.match_path, r.match_type,
-                r.distance_or_hash, r.reason
-            ])
+    try:
+        yield write_result
+    finally:
+        f.close()
 
 
 def print_summary(stats: Stats, logger: logging.Logger, dry_run: bool):
@@ -676,11 +765,33 @@ def main():
         print(f"ERROR: Target directory does not exist: {args.target}", file=sys.stderr)
         sys.exit(1)
 
-    # Create output directory
-    args.out.mkdir(parents=True, exist_ok=True)
+    # Validate directories don't overlap
+    ref_resolved = args.ref.resolve()
+    target_resolved = args.target.resolve()
+    out_resolved = args.out.resolve()
+
+    if out_resolved == ref_resolved or out_resolved == target_resolved:
+        print("ERROR: Output directory cannot be the same as reference or target", file=sys.stderr)
+        sys.exit(1)
+
+    if out_resolved.is_relative_to(ref_resolved) or out_resolved.is_relative_to(target_resolved):
+        print("ERROR: Output directory cannot be inside reference or target", file=sys.stderr)
+        sys.exit(1)
+
+    # Determine log/report output directory
+    # In dry-run mode, write logs/CSV to ./reports/ instead of --out
+    if args.dry_run:
+        log_output_dir = Path.cwd() / "reports"
+    else:
+        log_output_dir = args.out
+
+    # Create output directories
+    log_output_dir.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        args.out.mkdir(parents=True, exist_ok=True)
 
     # Setup logging
-    logger = setup_logging(args.out)
+    logger = setup_logging(log_output_dir)
 
     # Log configuration
     logger.info("=" * 60)
@@ -689,6 +800,7 @@ def main():
     logger.info(f"Reference:     {args.ref}")
     logger.info(f"Target:        {args.target}")
     logger.info(f"Output:        {args.out}")
+    logger.info(f"Log/Report:    {log_output_dir}")
     logger.info(f"Workers:       {args.workers}")
     logger.info(f"Chunk size:    {args.chunk_size:,} bytes")
     logger.info(f"pHash enabled: {not args.disable_phash}")
@@ -706,24 +818,24 @@ def main():
                         for ext in args.extensions.split(','))
         logger.info(f"Extension filter: {extensions}")
 
-    # Run deduplication
+    # Run deduplication with streaming CSV output
     try:
-        stats, results = run_deduplication(
-            ref_dir=args.ref,
-            target_dir=args.target,
-            output_dir=args.out,
-            workers=args.workers,
-            chunk_size=args.chunk_size,
-            phash_threshold=args.phash_threshold,
-            enable_phash=not args.disable_phash,
-            dry_run=args.dry_run,
-            extensions=extensions,
-            logger=logger
-        )
+        with streaming_csv_writer(log_output_dir) as csv_writer:
+            stats, results = run_deduplication(
+                ref_dir=args.ref,
+                target_dir=args.target,
+                output_dir=args.out,
+                workers=args.workers,
+                chunk_size=args.chunk_size,
+                phash_threshold=args.phash_threshold,
+                enable_phash=not args.disable_phash,
+                dry_run=args.dry_run,
+                extensions=extensions,
+                logger=logger,
+                csv_writer=csv_writer
+            )
 
-        # Write results CSV
-        write_results_csv(results, args.out)
-        logger.info(f"Results written to: {args.out / 'results.csv'}")
+        logger.info(f"Results written to: {log_output_dir / 'results.csv'}")
 
         # Print summary
         print_summary(stats, logger, args.dry_run)
